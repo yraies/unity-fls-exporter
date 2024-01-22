@@ -1,8 +1,8 @@
 use std::{env, net::ToSocketAddrs};
 
-use flexi_logger::Logger;
 use log::info;
 use serde::Deserialize;
+use simple_logger::SimpleLogger;
 use warp::{http::StatusCode, Filter};
 
 #[tokio::main]
@@ -11,38 +11,48 @@ async fn main() {
 }
 
 async fn run() {
-    Logger::with_env_or_str("info").start().unwrap();
-    let bind_addr = env::var("JLS_EXPORTER_BINDADDR")
-        .unwrap_or("0.0.0.0:9836".to_string())
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
+    let bind_addr = env::var("ULS_EXPORTER_BINDADDR")
+        .unwrap_or("0.0.0.0:9837".to_string())
         .to_socket_addrs()
-        .expect("failed to parse JLS_EXPORTER_BINDADDR")
+        .expect("failed to parse ULS_EXPORTER_BINDADDR")
         .next()
-        .expect("failed to parse JLS_EXPORTER_BINDADDR");
-    let jls_stats_token =
-        env::var("JLS_STATS_TOKEN").expect("Environment Variable JLS_STATS_TOKEN not set");
-    let jls_base_url = env::var("JLS_BASE_URL").expect("Environment Variable JLS_BASE_URL not set");
+        .expect("failed to parse ULS_EXPORTER_BINDADDR");
 
-    let jls_url = format!(
-        "{}/licenses-report.json?token={}",
-        jls_base_url, jls_stats_token
-    );
-    let jls_url = Box::leak(jls_url.into_boxed_str()) as &'static str;
-    info!("JLS url is {}", jls_url);
+    let uls_base_url = env::var("ULS_BASE_URL").expect("Environment Variable ULS_BASE_URL not set");
 
-    let index = warp::path::end().map(|| "Jetbrains FLS Exporter \n Metrics exported on /metrics");
+    let uls_lease_url = format!("{}/v1/admin/lease", uls_base_url);
+    let uls_lease_url = Box::leak(uls_lease_url.into_boxed_str()) as &'static str;
+    info!("ULS lease url is {}", uls_lease_url);
+
+    let uls_status_url = format!("{}/v1/admin/status", uls_base_url);
+    let uls_status_url = Box::leak(uls_status_url.into_boxed_str()) as &'static str;
+    info!("ULS status url is {}", uls_status_url);
+
+    let index =
+        warp::path::end().map(|| "Unity License Server Exporter \n Metrics exported on /metrics");
     let metrics = warp::path("metrics")
         .and(warp::path::end())
-        .and_then(move || metrics_handle(jls_url));
+        .and_then(move || metrics_handle(uls_status_url, uls_lease_url));
     warp::serve(index.or(metrics)).run(bind_addr).await
 }
 
-async fn metrics_handle(jls_url: &str) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
-    Ok(match metrics(jls_url).await {
+async fn metrics_handle(
+    status_endpoint: &str,
+    lease_endpoint: &str,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    Ok(match metrics(status_endpoint, lease_endpoint).await {
         Ok(s) => Box::new(s),
         Err(e) => Box::new(warp::reply::with_status(
             format!(
-                "An error occured while trying to contact the license server: \n{}",
-                e
+                "# An error occured while trying to contact the license server: \n# {}",
+                e.to_string()
+                    .split("\n")
+                    .collect::<Vec<&str>>()
+                    .join("\n# ")
             ),
             StatusCode::SERVICE_UNAVAILABLE,
         )),
@@ -50,44 +60,73 @@ async fn metrics_handle(jls_url: &str) -> Result<Box<dyn warp::Reply>, warp::Rej
 }
 
 #[derive(Debug, Deserialize)]
-struct LicensesReport {
-    licenses: Vec<License>,
+#[serde(rename_all = "PascalCase")]
+struct EntitlementContext {
+    environment_domain: String,
+    environment_hostname: String,
+    environment_user: String,
 }
+
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct License {
-    name: String,
-    available: i64,
-    allocated: i64,
+    floating_lease_id: i32,
+    client_entitlement_context: EntitlementContext,
+    is_revoked: bool,
 }
 
-async fn metrics(jls_url: &str) -> anyhow::Result<String> {
-    use prometheus::{Encoder, IntGaugeVec, Opts, Registry, TextEncoder};
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusReport {
+    server_status: String,
+    server_up_time_ms: i64,
+}
 
-    let report: LicensesReport = reqwest::get(jls_url).await?.json().await?;
-    let alloc_opts = Opts::new(
-        "jls_licenses_allocated",
-        "Number of JLS Licenses currently allocated",
-    );
-    let avail_opts = Opts::new(
-        "jls_licenses_available",
-        "Number of JLS Licenses currently available",
-    );
-    let alloc_gauge = IntGaugeVec::new(alloc_opts, &["license_name"])?;
-    let avail_gauge = IntGaugeVec::new(avail_opts, &["license_name"])?;
+async fn metrics(status_endpoint: &str, lease_endpoint: &str) -> anyhow::Result<String> {
+    use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 
-    // Create a Registry and register Counter.
     let r = Registry::new();
-    r.register(Box::new(alloc_gauge.clone())).unwrap();
-    r.register(Box::new(avail_gauge.clone())).unwrap();
 
-    for license in report.licenses.iter() {
-        alloc_gauge
-            .with_label_values(&[&license.name])
-            .set(license.allocated);
-        avail_gauge
-            .with_label_values(&[&license.name])
-            .set(license.available);
+    let status_report: StatusReport = reqwest::get(status_endpoint).await?.json().await?;
+
+    let health_gauge = IntGauge::new("uls_health", "Health of the ULS")?;
+    let uptime_gauge = IntGauge::new("uls_uptime_ms", "Uptime of the ULS in ms")?;
+
+    r.register(Box::new(health_gauge.clone())).unwrap();
+    r.register(Box::new(uptime_gauge.clone())).unwrap();
+
+    health_gauge.set(if status_report.server_status == "Healthy" {
+        1
+    } else {
+        0
+    });
+
+    uptime_gauge.set(status_report.server_up_time_ms);
+
+    if status_report.server_status == "Healthy" {
+        let report: Vec<License> = reqwest::get(lease_endpoint).await?.json().await?;
+        let lease_opts = Opts::new("uls_license_leased", "Currently leased ULS License");
+
+        let lease_gauge = IntGaugeVec::new(
+            lease_opts,
+            &["lease_id", "lease_user", "lease_hostname", "lease_domain"],
+        )?;
+
+        // Create a Registry and register Counter.
+        r.register(Box::new(lease_gauge.clone())).unwrap();
+
+        for license in report.iter() {
+            lease_gauge
+                .with_label_values(&[
+                    license.floating_lease_id.to_string().as_str(),
+                    &license.client_entitlement_context.environment_user,
+                    &license.client_entitlement_context.environment_hostname,
+                    &license.client_entitlement_context.environment_domain,
+                ])
+                .set(if license.is_revoked { 0 } else { 1 });
+        }
     }
+
     // Gather the metrics.
     let mut buffer = vec![];
     let encoder = TextEncoder::new();

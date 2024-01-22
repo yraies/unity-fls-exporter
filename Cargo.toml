@@ -1,7 +1,7 @@
 [package]
-name = "jetbrains-fls-exporter"
+name = "unity-fls-exporter"
 version = "0.1.0"
-authors = ["Michael Kreuzer <m-git@kreuzers.org>"]
+authors = ["Yasin Raies <3652076+yraies@users.noreply.github.com >", "Michael Kreuzer <m-git@kreuzers.org>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,10 +9,10 @@ edition = "2018"
 [dependencies]
 log = "0.4"
 anyhow = "1"
-prometheus = "0.12"
+prometheus = "0.13"
 warp = "0.3"
 reqwest = {version = "0.11", features = ["json"]}
 serde = { version = "1", features = ["derive"]}
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread","macros"]}
-flexi_logger = "0.17"
+simple_logger = "2.1"
